@@ -1,7 +1,6 @@
 # frozen_string_literal: true
 
 require 'nokogiri'
-require 'active_support/xml_mini/nokogiri' # convert Documents to hashes
 
 module HTML
   # GitHub HTML processing filters and utilities. This module includes a small
@@ -37,8 +36,8 @@ module HTML
     autoload :ImageFilter,           'html/pipeline/image_filter'
     autoload :ImageMaxWidthFilter,   'html/pipeline/image_max_width_filter'
     autoload :MarkdownFilter,        'html/pipeline/markdown_filter'
-    autoload :MentionFilter,         'html/pipeline/@mention_filter'
-    autoload :TeamMentionFilter,     'html/pipeline/@team_mention_filter'
+    autoload :MentionFilter,         'html/pipeline/mention_filter'
+    autoload :TeamMentionFilter,     'html/pipeline/team_mention_filter'
     autoload :PlainTextInputFilter,  'html/pipeline/plain_text_input_filter'
     autoload :SanitizationFilter,    'html/pipeline/sanitization_filter'
     autoload :SyntaxHighlightFilter, 'html/pipeline/syntax_highlight_filter'
@@ -47,11 +46,45 @@ module HTML
     autoload :TextFilter,            'html/pipeline/text_filter'
 
     class MissingDependencyError < RuntimeError; end
+
     def self.require_dependency(name, requirer)
       require name
     rescue LoadError => e
       raise MissingDependencyError,
             "Missing dependency '#{name}' for #{requirer}. See README.md for details.\n#{e.class.name}: #{e}"
+    end
+
+    def self.require_dependencies(names, requirer)
+      dependency_list = names.dup
+      loaded = false
+
+      while !loaded && names.length > 1
+        name = names.shift
+
+        begin
+          require_dependency(name, requirer)
+          loaded = true # we got a dependency
+          define_dependency_loaded_method(name, true)
+        # try the next dependency
+        rescue MissingDependencyError
+          define_dependency_loaded_method(name, false)
+        end
+      end
+
+      return if loaded
+
+      begin
+        name = names.shift
+        require name
+        define_dependency_loaded_method(name, true)
+      rescue LoadError => e
+        raise MissingDependencyError,
+              "Missing all dependencies '#{dependency_list.join(', ')}' for #{requirer}. See README.md for details.\n#{e.class.name}: #{e}"
+      end
+    end
+
+    def self.define_dependency_loaded_method(name, value)
+      self.class.define_method :"#{name}_loaded?", -> { value }
     end
 
     # Our DOM implementation.
@@ -77,8 +110,10 @@ module HTML
 
     # Public: String name for this Pipeline. Defaults to Class name.
     attr_writer :instrumentation_name
+
     def instrumentation_name
       return @instrumentation_name if defined?(@instrumentation_name)
+
       @instrumentation_name = self.class.name
     end
 
@@ -87,11 +122,12 @@ module HTML
       attr_accessor :default_instrumentation_service
     end
 
-    def initialize(filters, default_context = {}, result_class = nil)
+    def initialize(filters, default_context: {}, result_class: Hash)
       raise ArgumentError, 'default_context cannot be nil' if default_context.nil?
+
       @filters = filters.flatten.freeze
       @default_context = default_context.freeze
-      @result_class = result_class || Hash
+      @result_class = result_class
       @instrumentation_service = self.class.default_instrumentation_service
     end
 
@@ -107,16 +143,16 @@ module HTML
     # Returns the result Hash after being filtered by this Pipeline.  Contains an
     # :output key with the DocumentFragment or String HTML markup based on the
     # output of the last filter in the pipeline.
-    def call(html, context = {}, result = nil)
+    def call(html, context: {}, result: {})
       context = @default_context.merge(context)
       context = context.freeze
       result ||= @result_class.new
-      payload = default_payload filters: @filters.map(&:name),
-                                context: context, result: result
+      payload = default_payload({ filters: @filters.map(&:name),
+                                  context: context, result: result })
       instrument 'call_pipeline.html_pipeline', payload do
         result[:output] =
           @filters.inject(html) do |doc, filter|
-            perform_filter(filter, doc, context, result)
+            perform_filter(filter, doc, context: context, result: result)
           end
       end
       result
@@ -127,25 +163,25 @@ module HTML
     # The filter is instrumented.
     #
     # Returns the result of the filter.
-    def perform_filter(filter, doc, context, result)
-      payload = default_payload filter: filter.name,
-                                context: context, result: result
+    def perform_filter(filter, doc, context: {}, result: {})
+      payload = default_payload({ filter: filter.name,
+                                  context: context, result: result })
       instrument 'call_filter.html_pipeline', payload do
-        filter.call(doc, context, result)
+        filter.call(doc, context: context, result: result)
       end
     end
 
     # Like call but guarantee the value returned is a DocumentFragment.
     # Pipelines may return a DocumentFragment or a String. Callers that need a
     # DocumentFragment should use this method.
-    def to_document(input, context = {}, result = nil)
-      result = call(input, context, result)
+    def to_document(input, context: {}, result: {})
+      result = call(input, context: context, result: result)
       HTML::Pipeline.parse(result[:output])
     end
 
     # Like call but guarantee the value returned is a string of HTML markup.
-    def to_html(input, context = {}, result = nil)
-      result = call(input, context, result = nil)
+    def to_html(input, context: {}, result: {})
+      result = call(input, context: context, result: result)
       output = result[:output]
       if output.respond_to?(:to_html)
         output.to_html
@@ -157,7 +193,7 @@ module HTML
     # Public: setup instrumentation for this pipeline.
     #
     # Returns nothing.
-    def setup_instrumentation(name = nil, service = nil)
+    def setup_instrumentation(name, service: nil)
       self.instrumentation_name = name
       self.instrumentation_service =
         service || self.class.default_instrumentation_service
@@ -167,12 +203,11 @@ module HTML
     # block, otherwise the block is ran without instrumentation.
     #
     # Returns the result of the provided block.
-    def instrument(event, payload = nil)
+    def instrument(event, payload = {}, &block)
       payload ||= default_payload
       return yield(payload) unless instrumentation_service
-      instrumentation_service.instrument event, payload do |payload|
-        yield payload
-      end
+
+      instrumentation_service.instrument event, payload, &block
     end
 
     # Internal: Default payload for instrumentation.
@@ -182,29 +217,6 @@ module HTML
     # Returns a Hash.
     def default_payload(payload = {})
       { pipeline: instrumentation_name }.merge(payload)
-    end
-  end
-end
-
-# XXX nokogiri monkey patches for 1.8
-unless ''.respond_to?(:force_encoding)
-  class Nokogiri::XML::Node
-    # Work around an issue with utf-8 encoded data being erroneously converted to
-    # ... some other shit when replacing text nodes. See 'utf-8 output 2' in
-    # user_content_test.rb for details.
-    def replace_with_encoding_fix(replacement)
-      if replacement.respond_to?(:to_str)
-        replacement = document.fragment("<div>#{replacement}</div>").children.first.children
-      end
-      replace_without_encoding_fix(replacement)
-    end
-
-    alias replace_without_encoding_fix replace
-    alias replace replace_with_encoding_fix
-
-    def swap(replacement)
-      replace(replacement)
-      self
     end
   end
 end
